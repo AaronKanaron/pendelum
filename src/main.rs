@@ -3,13 +3,16 @@ use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::{
     dpi::LogicalSize,
-    event::{ElementState, Event, KeyboardInput, MouseButton, MouseScrollDelta, VirtualKeyCode, WindowEvent},
+    event::{
+        ElementState, Event, KeyboardInput, MouseButton, MouseScrollDelta, VirtualKeyCode,
+        WindowEvent,
+    },
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
 
-const WIDTH: u32 = 1800;
-const HEIGHT: u32 = 1800;
+const WIDTH: u32 = 800;
+const HEIGHT: u32 = 800;
 
 struct DoublePendulumRenderer {
     device: wgpu::Device,
@@ -384,7 +387,7 @@ fn main() -> Result<(), Error> {
 
     let event_loop = EventLoop::new();
     let window = {
-        let size = LogicalSize::new(WIDTH as f64 / 2.0, HEIGHT as f64 / 2.0);
+        let size = LogicalSize::new(WIDTH as f64, HEIGHT as f64);
         WindowBuilder::new()
             .with_title("Double Pendulum Fractal - GPU Accelerated")
             .with_inner_size(size)
@@ -449,9 +452,11 @@ fn main() -> Result<(), Error> {
                         MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.1,
                     };
                     // zoom factor per tick:
-                    let zoom_amount = 1.0 - scroll * 0.1;
-                    renderer.params.half_span1 *= zoom_amount;
-                    renderer.params.half_span2 *= zoom_amount;
+                    let scale = (1.0 + scroll * 0.1).max(0.1);
+                    renderer.params.half_span1 /= scale;
+                    renderer.params.half_span2 /= scale;
+                    // renderer.params.half_span1 *= zoom_amount;
+                    // renderer.params.half_span2 *= zoom_amount;
                     renderer.queue.write_buffer(
                         &renderer.params_buffer,
                         0,
@@ -477,7 +482,7 @@ fn main() -> Result<(), Error> {
                         // note: window size → params.half_span
                         let (w, h) = (renderer.params.width as f32, renderer.params.height as f32);
                         let ang_dx = -(dx as f32 / w) * (2.0 * renderer.params.half_span1);
-                        let ang_dy = (dy as f32 / h) * (2.0 * renderer.params.half_span2);
+                        let ang_dy = -(dy as f32 / h) * (2.0 * renderer.params.half_span2);
                         renderer.params.center_theta1 += ang_dx;
                         renderer.params.center_theta2 += ang_dy;
                         renderer.queue.write_buffer(
