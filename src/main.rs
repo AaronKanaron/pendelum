@@ -27,13 +27,16 @@ struct DoublePendulumRenderer {
     sensitivity: f32,
 
     /// Trajectory points in normalized coordinates [0..1]
-    trajectory: Option<Vec<[f32; 4]>>, // [x1, y1, x2, y2] per frame
+    trajectory: Option<Vec<[f32; 2]>>, // [x1, y1, x2, y2] per frame
     /// Animation progress index
     traj_index: usize,
     /// Whether we animate over time (vs. static draw)
     animate_traj: bool,
 
-    click_pos: Option<(f64, f64)>,
+    click_angles: Option<(f32, f32)>,
+
+    screen_w: f32,
+    screen_h: f32,
 }
 
 #[repr(C)]
@@ -198,7 +201,9 @@ impl DoublePendulumRenderer {
             trajectory: None,
             traj_index: 0,
             animate_traj: false,
-            click_pos: None,
+            click_angles: None,
+            screen_w: WIDTH as f32,
+            screen_h: HEIGHT as f32,
         }
     }
 
@@ -392,8 +397,9 @@ impl DoublePendulumRenderer {
         false
     }
 
-    fn simulate_single(&self, theta1: f32, theta2: f32) -> Vec<[f32; 4]> {
+    fn simulate_single(&self, theta1: f32, theta2: f32) -> Vec<[f32; 2]> {
         let mut traj = Vec::with_capacity(self.params.time_steps as usize);
+
         let mut th1 = theta1;
         let mut th2 = theta2;
         let mut om1 = 0.0;
@@ -426,74 +432,102 @@ impl DoublePendulumRenderer {
             th1 += om1 * dt;
             th2 += om2 * dt;
             // positions in normalized device coords [-1..1]
-            let x1 = th1.sin() * l1;
-            let y1 = -th1.cos() * l1;
-            let x2 = x1 + th2.sin() * l2;
-            let y2 = y1 - th2.cos() * l2;
-            traj.push([x1, y1, x2, y2]);
+            // let x1 = th1.sin() * l1;
+            // let y1 = -th1.cos() * l1;
+            // let x2 = x1 + th2.sin() * l2;
+            // let y2 = y1 - th2.cos() * l2;
+            // traj.push([x1, y1, x2, y2]);
+            traj.push([th1, th2]);
         }
         traj
     }
 
+    /// Call on every frame (after computing the fractal), so the trace
+    /// will re‐project if you pan/zoom.
     fn overlay_trajectory(&mut self, frame: &mut [u8]) {
-        if let Some(traj) = &self.trajectory {
-            let max_pts = if self.animate_traj {
-                self.traj_index = (self.traj_index + 1).min(traj.len());
-                self.traj_index
+        let (traj, (_, _)) =
+            if let (Some(traj), Some(angles)) = (&self.trajectory, &self.click_angles) {
+                (traj, *angles)
             } else {
-                traj.len()
+                return;
             };
 
-            // Screen center and scale: assume max length = l1 + l2
-            let w = self.params.width as i32;
-            let h = self.params.height as i32;
-            let cx = w / 2;
-            let cy = h / 2;
-            let max_reach = (self.params.length1 + self.params.length2) as f32;
-            let scale = (w.min(h) as f32 / 2.0) / max_reach;
+        // number of points to draw
+        let pts = if self.animate_traj {
+            self.traj_index = (self.traj_index + 1).min(traj.len());
+            self.traj_index
+        } else {
+            traj.len()
+        };
 
-            // Helper to draw a thicker point
-            fn draw_point(frame: &mut [u8], x: i32, y: i32, w: i32, h: i32) {
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        let px = x + dx;
-                        let py = y + dy;
-                        if px >= 0 && px < w && py >= 0 && py < h {
-                            let idx = (py as usize * w as usize + px as usize) * 4;
-                            frame[idx] = 255;
-                            frame[idx + 1] = 0;
-                            frame[idx + 2] = 0;
-                            frame[idx + 3] = 255;
-                        }
+        let buf_w = self.params.width as i32;
+        let buf_h = self.params.height as i32;
+
+        // helper to draw a 3×3 red block in the pixel buffer
+        fn draw_block(buf: &mut [u8], x: i32, y: i32, W: i32, H: i32) {
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let px = x + dx;
+                    let py = y + dy;
+                    if (0..W).contains(&px) && (0..H).contains(&py) {
+                        // buffer is exactly W*H*4 bytes long
+                        let idx = ((py as usize) * W as usize + px as usize) * 4;
+
+                        buf[idx + 0] = 255; // R
+                        buf[idx + 1] = 0; // G
+                        buf[idx + 2] = 0; // B
+                        buf[idx + 3] = 255; // A
                     }
                 }
-            }
-
-            // Draw and connect points
-            let mut prev_screen: Option<(i32, i32)> = None;
-            for &pt in &traj[..max_pts] {
-                let x1 = (pt[2] * scale) as i32 + cx;
-                let y1 = (pt[3] * scale) as i32 + cy;
-
-                // Draw thick point
-                draw_point(frame, x1, y1, w, h);
-
-                // Connect to previous
-                if let Some((px, py)) = prev_screen {
-                    let dx = x1 - px;
-                    let dy = y1 - py;
-                    let steps = dx.abs().max(dy.abs());
-                    for i in 1..=steps {
-                        let ix = px + dx * i / steps;
-                        let iy = py + dy * i / steps;
-                        draw_point(frame, ix, iy, w, h);
-                    }
-                }
-                prev_screen = Some((x1, y1));
             }
         }
+
+        let mut prev: Option<(i32, i32)> = None;
+
+        // plot each (θ₁,θ₂) in the same way your fractal uses angles→pixels
+        for &[th1, th2] in traj.iter().take(pts) {
+            // let nx = (th1 - self.params.center_theta1) / self.params.half_span1;
+            // let ny = (th2 - self.params.center_theta2) / self.params.half_span2;
+            // let sx = ((nx * 0.5 + 0.5) * w) as i32;
+            // let sy = ((ny * 0.5 + 0.5) * h) as i32;
+            let (sx, sy) = self.world_to_screen(th1, th2);
+
+            draw_block(frame, sx, sy, buf_w, buf_h);
+
+            if let Some((px, py)) = prev {
+                let dx = sx - px;
+                let dy = sy - py;
+                let steps = dx.abs().max(dy.abs()).max(1);
+                for i in 1..=steps {
+                    let ix = px + dx * i / steps;
+                    let iy = py + dy * i / steps;
+                    draw_block(frame, ix, iy, buf_w, buf_h);
+                }
+            }
+            prev = Some((sx, sy));
+        }
+    }
+
+    fn screen_to_world(&self, x: f32, y: f32) -> (f32, f32) {
+        // use real on‐screen dims, not params.width/height
+        let nx = (x / self.screen_w - 0.5) * 2.0;
+        let ny = (y / self.screen_h - 0.5) * 2.0;
+        let t1 = self.params.center_theta1 + nx * self.params.half_span1;
+        let t2 = self.params.center_theta2 + ny * self.params.half_span2;
+        (t1, t2)
+    }
+
+    fn world_to_screen(&self, theta1: f32, theta2: f32) -> (i32, i32) {
+        let nx = (theta1 - self.params.center_theta1) / self.params.half_span1;
+        let ny = (theta2 - self.params.center_theta2) / self.params.half_span2;
+        // map into the *fixed* buffer dimensions (WIDTH×HEIGHT)
+        let sx = ((nx * 0.5 + 0.5) * (self.params.width as f32)) as i32;
+        let sy = ((ny * 0.5 + 0.5) * (self.params.height as f32)) as i32;
+        (sx, sy)
     }
 }
+
+
 
 const COMPUTE_SHADER: &str = include_str!("main.wgsl");
 
@@ -516,6 +550,8 @@ fn main() -> Result<(), Error> {
     let mut pixels = Pixels::new(WIDTH, HEIGHT, surface_texture)?;
 
     let mut renderer = pollster::block_on(DoublePendulumRenderer::new());
+    renderer.screen_w = window_size.width as f32;
+    renderer.screen_h = window_size.height as f32;
     let mut last_frame_time = Instant::now();
     let mut frame_rendered = false;
 
@@ -529,6 +565,7 @@ fn main() -> Result<(), Error> {
     let mut last_cursor: Option<(f64, f64)> = None;
     let mut click_pos: Option<(f64, f64)> = None;
     let mut pan_prev: Option<(f64, f64)> = None;
+    let mut shift_down = false;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
@@ -544,20 +581,27 @@ fn main() -> Result<(), Error> {
                 event: WindowEvent::KeyboardInput { input, .. },
                 ..
             } => {
-                if input.state == winit::event::ElementState::Pressed {
-                    match input.virtual_keycode {
-                        Some(VirtualKeyCode::Escape) => {
-                            *control_flow = ControlFlow::Exit;
-                        }
-                        Some(VirtualKeyCode::R) => {
-                            // Trigger re-render
-                            frame_rendered = false;
-                        }
-                        _ => {
-                            if renderer.handle_key_input(input) {
-                                frame_rendered = false;
-                            }
-                        }
+                if let Some(key) = input.virtual_keycode {
+                    if key == VirtualKeyCode::LShift || key == VirtualKeyCode::RShift {
+                        shift_down = input.state == ElementState::Pressed;
+                        println!("Shift key state: {:?}", input.state);
+                    }
+                }
+
+                // 2) Then early‐exit on Escape/R (or pass to your existing handler):
+                if input.state == ElementState::Pressed {
+                    if let Some(VirtualKeyCode::Escape) = input.virtual_keycode {
+                        *control_flow = ControlFlow::Exit;
+                        return;
+                    }
+                    if let Some(VirtualKeyCode::R) = input.virtual_keycode {
+                        frame_rendered = false;
+                        return;
+                    }
+
+                    // 3) Finally, non‐Shift & non‐special keys for pendulum params:
+                    if renderer.handle_key_input(input) {
+                        frame_rendered = false;
                     }
                 }
             }
@@ -566,20 +610,24 @@ fn main() -> Result<(), Error> {
                 ..
             } => {
                 pixels.resize_surface(size.width, size.height).ok();
+                renderer.screen_w = size.width as f32;
+                renderer.screen_h = size.height as f32;
             }
 
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::MouseWheel { delta, .. } => {
+                    // compute scroll direction & strength
                     let scroll = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y as f32,
                         MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.1,
                     };
-                    // zoom factor per tick:
-                    let scale = (1.0 + scroll * 0.1).max(0.1);
-                    renderer.params.half_span1 /= scale;
-                    renderer.params.half_span2 /= scale;
-                    // renderer.params.half_span1 *= zoom_amount;
-                    // renderer.params.half_span2 *= zoom_amount;
+                    let zoom_factor = (1.0 + scroll * 0.1).max(0.1);
+
+                    // **ONLY** shrink/grow your world‐span
+                    renderer.params.half_span1 /= zoom_factor;
+                    renderer.params.half_span2 /= zoom_factor;
+
+                    // push the new spans up to the GPU
                     renderer.queue.write_buffer(
                         &renderer.params_buffer,
                         0,
@@ -590,28 +638,38 @@ fn main() -> Result<(), Error> {
 
                 WindowEvent::CursorMoved { position, .. } => {
                     last_cursor = Some((position.x, position.y));
+                    if let Some((ex, ey)) = last_cursor {
+                        // If left mouse is down and Shift is NOT pressed -> update preview
+                        if dragging && !shift_down {
+                            // Map to normalized coords
+                            let (theta1, theta2) = renderer.screen_to_world(ex as f32, ey as f32);
 
-                    if dragging {
-                        // Compute pan delta from pan_prev
-                        if let Some((px, py)) = pan_prev {
-                            let dx = position.x - px;
-                            let dy = position.y - py;
-                            // Convert to angle offsets
-                            let (w, h) =
-                                (renderer.params.width as f32, renderer.params.height as f32);
-                            renderer.params.center_theta1 -=
-                                (dx as f32 / w) * (2.0 * renderer.params.half_span1);
-                            renderer.params.center_theta2 -=
-                                (dy as f32 / h) * (2.0 * renderer.params.half_span2);
-                            renderer.queue.write_buffer(
-                                &renderer.params_buffer,
-                                0,
-                                bytemuck::cast_slice(&[renderer.params]),
-                            );
+                            renderer.click_angles = Some((theta1, theta2));
+                            renderer.trajectory = Some(renderer.simulate_single(theta1, theta2));
+                            renderer.traj_index = 0;
+                            renderer.animate_traj = false;
                             frame_rendered = false;
                         }
-                        // Update pan_prev for next move
-                        pan_prev = last_cursor;
+
+                        // If Shift is down and left-button held -> pan
+                        if dragging && shift_down {
+                            if let Some((px0, py0)) = pan_prev {
+                                // world before vs. after
+                                let (t10, t20) = renderer.screen_to_world(px0 as f32, py0 as f32);
+                                let (t1n, t2n) = renderer.screen_to_world(ex as f32, ey as f32);
+
+                                renderer.params.center_theta1 -= t1n - t10;
+                                renderer.params.center_theta2 -= t2n - t20;
+
+                                renderer.queue.write_buffer(
+                                    &renderer.params_buffer,
+                                    0,
+                                    bytemuck::cast_slice(&[renderer.params]),
+                                );
+                                frame_rendered = false;
+                            }
+                            pan_prev = last_cursor;
+                        }
                     }
                 }
 
@@ -623,28 +681,26 @@ fn main() -> Result<(), Error> {
                     match state {
                         ElementState::Pressed => {
                             dragging = true;
-                            click_pos = last_cursor; // record where click began
-                            pan_prev = last_cursor; // initialize for panning
+                            click_pos = last_cursor;
+                            pan_prev = last_cursor;
                         }
                         ElementState::Released => {
                             dragging = false;
-                            pan_prev = None; // stop panning
-                            println!("Click position: {:?}", click_pos);
-
-                            // If press & release were close → treat as click
+                            pan_prev = None;
+                            // On release, only finalize click if it was a true click (not drag)
                             if let (Some((sx, sy)), Some((ex, ey))) = (click_pos, last_cursor) {
                                 let dist2 = (sx - ex).powi(2) + (sy - ey).powi(2);
                                 if dist2 < 25.0 {
-                                    // within 5px
-                                    // Map pixel to normalized coords, then to angles
-                                    let nx = (ex as f32 / WIDTH as f32 - 0.5) * 2.0;
-                                    let ny = (ey as f32 / HEIGHT as f32 - 0.5) * 2.0;
-                                    let theta1 = renderer.params.center_theta1
-                                        + nx * renderer.params.half_span1;
-                                    let theta2 = renderer.params.center_theta2
-                                        + ny * renderer.params.half_span2;
-
-                                    // Launch single-pendulum sim
+                                    // compute and store final angles & sim
+                                    // let nx = (ex as f32 / WIDTH as f32 - 0.5) * 2.0;
+                                    // let ny = (ey as f32 / HEIGHT as f32 - 0.5) * 2.0;
+                                    // let theta1 = renderer.params.center_theta1
+                                    //     + nx * renderer.params.half_span1;
+                                    // let theta2 = renderer.params.center_theta2
+                                    //     + ny * renderer.params.half_span2;
+                                    let (theta1, theta2) =
+                                        renderer.screen_to_world(ex as f32, ey as f32);
+                                    renderer.click_angles = Some((theta1, theta2));
                                     renderer.trajectory =
                                         Some(renderer.simulate_single(theta1, theta2));
                                     renderer.traj_index = 0;
