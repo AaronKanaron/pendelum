@@ -83,27 +83,29 @@ fn velocity_to_color(v: vec2<f32>) -> vec3<f32> {
     let speed = length(v);
     let normalized_speed = min(speed / 10.0, 1.0);
 
-    if normalized_speed < 0.5 {
-        // White to blue transition (slow to medium speeds)
-        let t = normalized_speed * 2.0; // Map 0-0.5 to 0-1
-        let white = vec3<f32>(1.0, 1.0, 1.0);
-        let blue = vec3<f32>(0.0, 0.0, 1.0);
-        return mix(white, blue, t);
-    } else {
-        // Blue to black transition (medium to fast speeds)
-        let t = (normalized_speed - 0.5) * 2.0; // Map 0.5-1 to 0-1
-        let blue = vec3<f32>(0.0, 0.0, 1.0);
-        let black = vec3<f32>(0.0, 0.0, 0.0);
-        return mix(blue, black, t);
-    }
-    // let angle = atan2(v.y, v.x);
-    // let hue = (angle + 3.14159) / (2.0 * 3.14159);
+    // if normalized_speed < 0.5 {
+    //     // White to blue transition (slow to medium speeds)
+    //     let t = normalized_speed * 2.0; // Map 0-0.5 to 0-1
+    //     let white = vec3<f32>(1.0, 1.0, 1.0);
+    //     let blue = vec3<f32>(0.0, 0.0, 1.0);
+    //     return mix(white, blue, t);
+    // } else {
+    //     // Blue to black transition (medium to fast speeds)
+    //     let t = (normalized_speed - 0.5) * 2.0; // Map 0.5-1 to 0-1
+    //     let blue = vec3<f32>(0.0, 0.0, 1.0);
+    //     let black = vec3<f32>(0.0, 0.0, 0.0);
+    //     return mix(blue, black, t);
+    // }
+    let angle = atan2(v.y, v.x);
+    let hue = (angle + 3.14159) / (2.0 * 3.14159);
     
-    // let saturation = normalized_speed;
-    // let value = 0.5 + 0.5 * normalized_speed;
+    let saturation = normalized_speed;
+    let value = 0.5 + 0.5 * normalized_speed;
     
-    // return hsv_to_rgb(vec3<f32>(hue, saturation, value));
+    return hsv_to_rgb(vec3<f32>(hue, saturation, value));
 }
+
+
 
 fn hsv_to_rgb(hsv: vec3<f32>) -> vec3<f32> {
     let h = hsv.x * 6.0;

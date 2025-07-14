@@ -1,5 +1,13 @@
+use atomic_float::AtomicF32;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use pixels::{Error, Pixels, SurfaceTexture};
-use std::time::Instant;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 use wgpu::util::DeviceExt;
 use winit::{
     dpi::LogicalSize,
@@ -28,6 +36,7 @@ struct DoublePendulumRenderer {
 
     /// Trajectory points in normalized coordinates [0..1]
     trajectory: Option<Vec<[f32; 2]>>, // [x1, y1, x2, y2] per frame
+    traj_velocities: Option<Vec<[f32; 2]>>,
     /// Animation progress index
     traj_index: usize,
     /// Whether we animate over time (vs. static draw)
@@ -199,6 +208,7 @@ impl DoublePendulumRenderer {
             params,
             sensitivity: 0.1, // Default sensitivity
             trajectory: None,
+            traj_velocities: None,
             traj_index: 0,
             animate_traj: false,
             click_angles: None,
@@ -397,13 +407,21 @@ impl DoublePendulumRenderer {
         false
     }
 
-    fn simulate_single(&self, theta1: f32, theta2: f32) -> Vec<[f32; 2]> {
+    /// Simulate one pendulum for `time_steps` and return the final angular velocities.
+    fn simulate_single(
+        &self,
+        theta1: f32,
+        theta2: f32,
+    ) -> (Vec<[f32; 2]>, Vec<[f32; 2]>, f32, f32) {
         let mut traj = Vec::with_capacity(self.params.time_steps as usize);
 
+        // state
         let mut th1 = theta1;
         let mut th2 = theta2;
         let mut om1 = 0.0;
         let mut om2 = 0.0;
+
+        // aliases
         let dt = self.params.dt;
         let g = self.params.gravity;
         let l1 = self.params.length1;
@@ -412,34 +430,39 @@ impl DoublePendulumRenderer {
         let m2 = self.params.mass2;
         let damping = self.params.damping;
 
+        let mut vel_hist = Vec::with_capacity(self.params.time_steps as usize);
         for _ in 0..self.params.time_steps {
-            // physics step (same as WGSL simulate)
+            // compute accelerations
             let c = (th1 - th2).cos();
             let s = (th1 - th2).sin();
             let denom = l1 * (2.0 * m1 + m2 - m2 * (2.0 * th1 - 2.0 * th2).cos());
+
             let num1 = -m2 * g * (th1 - 2.0 * th2).sin()
                 - 2.0 * s * m2 * (om2 * om2 * l2 + om1 * om1 * l1 * c)
                 - (m1 + m2) * g * th1.sin();
+
             let num2 = 2.0
                 * s
                 * (om1 * om1 * l1 * (m1 + m2)
                     + g * (m1 + m2) * th1.cos()
                     + om2 * om2 * l2 * m2 * c);
+
             let a1 = num1 / denom;
             let a2 = num2 / (l2 * denom);
+
+            // integrate & damp
             om1 = (om1 + a1 * dt) * damping;
             om2 = (om2 + a2 * dt) * damping;
             th1 += om1 * dt;
             th2 += om2 * dt;
-            // positions in normalized device coords [-1..1]
-            // let x1 = th1.sin() * l1;
-            // let y1 = -th1.cos() * l1;
-            // let x2 = x1 + th2.sin() * l2;
-            // let y2 = y1 - th2.cos() * l2;
-            // traj.push([x1, y1, x2, y2]);
+
+            // record angles for your fractal trace
             traj.push([th1, th2]);
+            vel_hist.push([om1, om2]);
         }
-        traj
+
+        // return the trajectory plus the final omegas
+        (traj, vel_hist, om1, om2)
     }
 
     /// Call on every frame (after computing the fractal), so the trace
@@ -454,7 +477,7 @@ impl DoublePendulumRenderer {
 
         // number of points to draw
         let pts = if self.animate_traj {
-            self.traj_index = (self.traj_index + 1).min(traj.len());
+            self.traj_index = (self.traj_index + 4).min(traj.len());
             self.traj_index
         } else {
             traj.len()
@@ -527,9 +550,141 @@ impl DoublePendulumRenderer {
     }
 }
 
-
+struct AudioState {
+    freq_left: Arc<AtomicF32>,
+    freq_right: Arc<AtomicF32>,
+    vel_left: Arc<AtomicF32>, // last angular velocity
+    vel_right: Arc<AtomicF32>,
+    mute: Arc<AtomicBool>,
+    _stream: cpal::Stream,
+}
 
 const COMPUTE_SHADER: &str = include_str!("main.wgsl");
+
+fn setup_audio(low_hz: f32, high_hz: f32) -> AudioState {
+    let host = cpal::default_host();
+    let device = host.default_output_device().expect("no output device");
+    let config = device.default_output_config().unwrap();
+    let sample_rate = config.sample_rate().0 as f32;
+    let channels = config.channels() as usize;
+
+    // Shared frequency targets:
+    let freq_left = Arc::new(AtomicF32::new((low_hz + high_hz) / 2.0));
+    let freq_right = Arc::new(AtomicF32::new((low_hz + high_hz) / 2.0));
+    let vel_left = Arc::new(AtomicF32::new(0.0));
+    let vel_right = Arc::new(AtomicF32::new(0.0));
+    let mute = Arc::new(AtomicBool::new(false));
+
+    // Clone for callback:
+    let fl = freq_left.clone();
+    let fr = freq_right.clone();
+    let vl = vel_left.clone();
+    let vr = vel_right.clone();
+    let m = mute.clone();
+
+    // Phase accumulators:
+    let mut phase_l = 0.0_f32;
+    let mut phase_r = 0.0_f32;
+
+    // Build the stream:
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => device.build_output_stream(
+            &config.into(),
+            move |data: &mut [f32], _| {
+                for frame in data.chunks_mut(channels) {
+                    if m.load(Ordering::Relaxed) {
+                        for sample in frame.iter_mut() {
+                            *sample = 0.0;
+                        }
+                        continue;
+                    }
+                    // Read target freqs
+                    let target_l = fl.load(Ordering::Relaxed);
+                    let target_r = fr.load(Ordering::Relaxed);
+
+                    let vel_l = vl.load(Ordering::Relaxed).abs();
+                    let vel_r = vr.load(Ordering::Relaxed).abs();
+
+                    // Increment phases
+                    // phase_l += target_l * 2.0 * std::f32::consts::PI / sample_rate;
+                    // phase_r += target_r * 2.0 * std::f32::consts::PI / sample_rate;
+                    fn harmonic_mix(phase: f32, vel: f32) -> f32 {
+                        // define thresholds
+                        let t_low = 2.0;
+                        let t_high = 8.0;
+                        // interpolation factor in [0,1]
+                        let u = ((vel - t_low) / (t_high - t_low)).clamp(0.0, 1.0);
+                        let mut sum = 0.0;
+                        let mut norm = 0.0;
+                        for h in 1..=5 {
+                            // weight harmonics: lower velocity favors fundamental/harmonic 2, high adds 3-5
+                            let w = if h <= 2 {
+                                1.0 - u * 0.5 // reduce only slightly at high vel
+                            } else {
+                                u * (h as f32 / 5.0)
+                            };
+                            sum += w * (phase * h as f32).sin();
+                            norm += w;
+                        }
+                        sum / norm
+                    }
+
+                    phase_l += target_l * 2.0 * std::f32::consts::PI / sample_rate;
+                    phase_r += target_r * 2.0 * std::f32::consts::PI / sample_rate;
+
+                    // Wrap back into [0..2π]
+                    if phase_l > std::f32::consts::TAU {
+                        phase_l -= std::f32::consts::TAU;
+                    }
+                    if phase_r > std::f32::consts::TAU {
+                        phase_r -= std::f32::consts::TAU;
+                    }
+
+                    let sample_l = harmonic_mix(phase_l, vel_l);
+                    let sample_r = harmonic_mix(phase_r, vel_r);
+
+                    // Wrap
+                    // if phase_l > std::f32::consts::TAU {
+                    //     phase_l -= std::f32::consts::TAU
+                    // }
+                    // if phase_r > std::f32::consts::TAU {
+                    //     phase_r -= std::f32::consts::TAU
+                    // }
+
+                    // let sample_l = phase_l.sin();
+                    // let sample_r = phase_r.sin();
+
+                    // Stereo
+                    frame[0] = sample_l;
+                    if channels > 1 {
+                        frame[1] = sample_r;
+                    }
+                }
+            },
+            move |err| eprintln!("Audio error: {}", err),
+            None,
+        ),
+        _ => panic!("Unsupported sample format"),
+    }
+    .unwrap();
+
+    stream.play().unwrap();
+
+    AudioState {
+        freq_left,
+        freq_right,
+        vel_left,
+        vel_right,
+        mute,
+        _stream: stream,
+    }
+}
+
+fn map_vel_to_freq(v: f32, v_max: f32, low: f32, high: f32) -> f32 {
+    let v_clamped = v.max(-v_max).min(v_max);
+    let t = (v_clamped + v_max) / (2.0 * v_max);
+    low + t * (high - low)
+}
 
 fn main() -> Result<(), Error> {
     env_logger::init();
@@ -550,6 +705,7 @@ fn main() -> Result<(), Error> {
     let mut pixels = Pixels::new(WIDTH, HEIGHT, surface_texture)?;
 
     let mut renderer = pollster::block_on(DoublePendulumRenderer::new());
+    let audio = setup_audio(100.0, 1000.0);
     renderer.screen_w = window_size.width as f32;
     renderer.screen_h = window_size.height as f32;
     let mut last_frame_time = Instant::now();
@@ -594,7 +750,10 @@ fn main() -> Result<(), Error> {
                         *control_flow = ControlFlow::Exit;
                         return;
                     }
-                    if let Some(VirtualKeyCode::R) = input.virtual_keycode {
+                    if let Some(VirtualKeyCode::X) = input.virtual_keycode {
+                        let new = !audio.mute.load(Ordering::Relaxed);
+                        audio.mute.store(new, Ordering::Relaxed);
+                        println!("Audio {}", if new { "muted" } else { "unmuted" });
                         frame_rendered = false;
                         return;
                     }
@@ -643,11 +802,29 @@ fn main() -> Result<(), Error> {
                         if dragging && !shift_down {
                             // Map to normalized coords
                             let (theta1, theta2) = renderer.screen_to_world(ex as f32, ey as f32);
+                            // let (trajectory, final_om1, final_om2) =
+                            //     renderer.simulate_single(theta1, theta2);
+
+                            let (traj, vel_hist, f1, f2) = renderer.simulate_single(theta1, theta2);
+                            renderer.traj_velocities = Some(vel_hist);
+                            (traj, f1, f2);
+
+                            // let f1 = map_vel_to_freq(final_om1, 10.0, 100.0, 1000.0);
+                            // let f2 = map_vel_to_freq(final_om2, 10.0, 100.0, 1000.0);
+                            // audio.freq_left.store(f1, Ordering::Relaxed);
+                            // audio.freq_right.store(f2, Ordering::Relaxed);
+                            let f1 = map_vel_to_freq(f1, 10.0, 100.0, 1000.0);
+                            let f2 = map_vel_to_freq(f2, 10.0, 100.0, 1000.0);
+                            // store base freq and last velocity
+                            audio.freq_left.store(f1, Ordering::Relaxed);
+                            audio.freq_right.store(f2, Ordering::Relaxed);
+                            audio.vel_left.store(f1, Ordering::Relaxed);
+                            audio.vel_right.store(f2, Ordering::Relaxed);
 
                             renderer.click_angles = Some((theta1, theta2));
-                            renderer.trajectory = Some(renderer.simulate_single(theta1, theta2));
+                            // renderer.trajectory = Some(traj);
                             renderer.traj_index = 0;
-                            renderer.animate_traj = false;
+                            renderer.animate_traj = true;
                             frame_rendered = false;
                         }
 
@@ -701,11 +878,28 @@ fn main() -> Result<(), Error> {
                                     let (theta1, theta2) =
                                         renderer.screen_to_world(ex as f32, ey as f32);
                                     renderer.click_angles = Some((theta1, theta2));
-                                    renderer.trajectory =
-                                        Some(renderer.simulate_single(theta1, theta2));
+                                    // let (trajectory, final_om1, final_om2) =
+                                    //     renderer.simulate_single(theta1, theta2);
+
+                                    let (traj, vel_hist, f1, f2) =
+                                        renderer.simulate_single(theta1, theta2);
+                                    renderer.trajectory = Some(traj);
+                                    renderer.traj_velocities = Some(vel_hist);
+                                    // (trajectory, final_om1, final_om2) =
+                                    //     (renderer.trajectory.as_ref().unwrap().clone(), f1, f2);
+
+                                    // renderer.trajectory = Some(traj);
                                     renderer.traj_index = 0;
-                                    renderer.animate_traj = false;
+                                    renderer.animate_traj = true;
                                     frame_rendered = false;
+
+                                    let f1 = map_vel_to_freq(f1, 10.0, 100.0, 1000.0);
+                                    let f2 = map_vel_to_freq(f2, 10.0, 100.0, 1000.0);
+                                    // store base freq and last velocity
+                                    audio.freq_left.store(f1, Ordering::Relaxed);
+                                    audio.freq_right.store(f2, Ordering::Relaxed);
+                                    audio.vel_left.store(f1, Ordering::Relaxed);
+                                    audio.vel_right.store(f2, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -722,10 +916,39 @@ fn main() -> Result<(), Error> {
 
                 renderer.update(delta_time);
 
-                if !frame_rendered {
+                let mut need_redraw = !frame_rendered;
+                if renderer.animate_traj {
+                    // as long as we haven't drawn the entire trajectory, keep animating
+                    need_redraw = true;
+                }
+                if need_redraw {
                     pollster::block_on(renderer.render(pixels.frame_mut()));
                     renderer.overlay_trajectory(pixels.frame_mut());
                     frame_rendered = true;
+
+                    // if we're animating, also drive audio from the current step
+                    if renderer.animate_traj {
+                        if let (Some(vels), Some(idx)) =
+                            (&renderer.traj_velocities, Some(renderer.traj_index.saturating_sub(1)))
+                        {
+                            let [om1, om2] = vels[idx.min(vels.len().saturating_sub(1))];
+                            let f1 = map_vel_to_freq(om1, 10.0, 100.0, 1000.0);
+                            let f2 = map_vel_to_freq(om2, 10.0, 100.0, 1000.0);
+                            audio.freq_left.store(f1, Ordering::Relaxed);
+                            audio.freq_right.store(f2, Ordering::Relaxed);
+                            audio.vel_left.store(om1, Ordering::Relaxed);
+                            audio.vel_right.store(om2, Ordering::Relaxed);
+                        }
+
+                        // keep animating until we hit the end
+                        if let Some(traj) = &renderer.trajectory {
+                            if renderer.traj_index < traj.len() {
+                                frame_rendered = false;
+                            } else {
+                                renderer.animate_traj = false;
+                            }
+                        }
+                    }
                 }
 
                 if pixels.render().is_err() {

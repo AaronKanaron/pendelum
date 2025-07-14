@@ -137,6 +137,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "atomic_float"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "628d228f918ac3b82fe590352cc719d30664a0c13ca3a60266fe02c7132d480a"
+
+[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -757,6 +763,7 @@ checksum = "9b112acc8b3adf4b107a8ec20977da0273a8c386765a3ec0229bd500a1443f9f"
 name = "image_test"
 version = "0.1.0"
 dependencies = [
+ "atomic_float",
  "bytemuck",
  "cpal",
  "env_logger",
