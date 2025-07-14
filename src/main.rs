@@ -25,6 +25,15 @@ struct DoublePendulumRenderer {
     time: f32,
     params: SimulationParams,
     sensitivity: f32,
+
+    /// Trajectory points in normalized coordinates [0..1]
+    trajectory: Option<Vec<[f32; 4]>>, // [x1, y1, x2, y2] per frame
+    /// Animation progress index
+    traj_index: usize,
+    /// Whether we animate over time (vs. static draw)
+    animate_traj: bool,
+
+    click_pos: Option<(f64, f64)>,
 }
 
 #[repr(C)]
@@ -186,6 +195,10 @@ impl DoublePendulumRenderer {
             time: 0.0,
             params,
             sensitivity: 0.1, // Default sensitivity
+            trajectory: None,
+            traj_index: 0,
+            animate_traj: false,
+            click_pos: None,
         }
     }
 
@@ -378,6 +391,108 @@ impl DoublePendulumRenderer {
 
         false
     }
+
+    fn simulate_single(&self, theta1: f32, theta2: f32) -> Vec<[f32; 4]> {
+        let mut traj = Vec::with_capacity(self.params.time_steps as usize);
+        let mut th1 = theta1;
+        let mut th2 = theta2;
+        let mut om1 = 0.0;
+        let mut om2 = 0.0;
+        let dt = self.params.dt;
+        let g = self.params.gravity;
+        let l1 = self.params.length1;
+        let l2 = self.params.length2;
+        let m1 = self.params.mass1;
+        let m2 = self.params.mass2;
+        let damping = self.params.damping;
+
+        for _ in 0..self.params.time_steps {
+            // physics step (same as WGSL simulate)
+            let c = (th1 - th2).cos();
+            let s = (th1 - th2).sin();
+            let denom = l1 * (2.0 * m1 + m2 - m2 * (2.0 * th1 - 2.0 * th2).cos());
+            let num1 = -m2 * g * (th1 - 2.0 * th2).sin()
+                - 2.0 * s * m2 * (om2 * om2 * l2 + om1 * om1 * l1 * c)
+                - (m1 + m2) * g * th1.sin();
+            let num2 = 2.0
+                * s
+                * (om1 * om1 * l1 * (m1 + m2)
+                    + g * (m1 + m2) * th1.cos()
+                    + om2 * om2 * l2 * m2 * c);
+            let a1 = num1 / denom;
+            let a2 = num2 / (l2 * denom);
+            om1 = (om1 + a1 * dt) * damping;
+            om2 = (om2 + a2 * dt) * damping;
+            th1 += om1 * dt;
+            th2 += om2 * dt;
+            // positions in normalized device coords [-1..1]
+            let x1 = th1.sin() * l1;
+            let y1 = -th1.cos() * l1;
+            let x2 = x1 + th2.sin() * l2;
+            let y2 = y1 - th2.cos() * l2;
+            traj.push([x1, y1, x2, y2]);
+        }
+        traj
+    }
+
+    fn overlay_trajectory(&mut self, frame: &mut [u8]) {
+        if let Some(traj) = &self.trajectory {
+            let max_pts = if self.animate_traj {
+                self.traj_index = (self.traj_index + 1).min(traj.len());
+                self.traj_index
+            } else {
+                traj.len()
+            };
+
+            // Screen center and scale: assume max length = l1 + l2
+            let w = self.params.width as i32;
+            let h = self.params.height as i32;
+            let cx = w / 2;
+            let cy = h / 2;
+            let max_reach = (self.params.length1 + self.params.length2) as f32;
+            let scale = (w.min(h) as f32 / 2.0) / max_reach;
+
+            // Helper to draw a thicker point
+            fn draw_point(frame: &mut [u8], x: i32, y: i32, w: i32, h: i32) {
+                for dy in -1..=1 {
+                    for dx in -1..=1 {
+                        let px = x + dx;
+                        let py = y + dy;
+                        if px >= 0 && px < w && py >= 0 && py < h {
+                            let idx = (py as usize * w as usize + px as usize) * 4;
+                            frame[idx] = 255;
+                            frame[idx + 1] = 0;
+                            frame[idx + 2] = 0;
+                            frame[idx + 3] = 255;
+                        }
+                    }
+                }
+            }
+
+            // Draw and connect points
+            let mut prev_screen: Option<(i32, i32)> = None;
+            for &pt in &traj[..max_pts] {
+                let x1 = (pt[2] * scale) as i32 + cx;
+                let y1 = (pt[3] * scale) as i32 + cy;
+
+                // Draw thick point
+                draw_point(frame, x1, y1, w, h);
+
+                // Connect to previous
+                if let Some((px, py)) = prev_screen {
+                    let dx = x1 - px;
+                    let dy = y1 - py;
+                    let steps = dx.abs().max(dy.abs());
+                    for i in 1..=steps {
+                        let ix = px + dx * i / steps;
+                        let iy = py + dy * i / steps;
+                        draw_point(frame, ix, iy, w, h);
+                    }
+                }
+                prev_screen = Some((x1, y1));
+            }
+        }
+    }
 }
 
 const COMPUTE_SHADER: &str = include_str!("main.wgsl");
@@ -404,8 +519,16 @@ fn main() -> Result<(), Error> {
     let mut last_frame_time = Instant::now();
     let mut frame_rendered = false;
 
+    // let mut dragging = false;
+    // let mut last_cursor: Option<(f64, f64)> = None;
+
+    // let mut dragging = false;
+    // let mut last_cursor: Option<(f64, f64)> = None;
+    // renderer.click_pos = None;
     let mut dragging = false;
     let mut last_cursor: Option<(f64, f64)> = None;
+    let mut click_pos: Option<(f64, f64)> = None;
+    let mut pan_prev: Option<(f64, f64)> = None;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
@@ -464,38 +587,78 @@ fn main() -> Result<(), Error> {
                     );
                     frame_rendered = false;
                 }
+
+                WindowEvent::CursorMoved { position, .. } => {
+                    last_cursor = Some((position.x, position.y));
+
+                    if dragging {
+                        // Compute pan delta from pan_prev
+                        if let Some((px, py)) = pan_prev {
+                            let dx = position.x - px;
+                            let dy = position.y - py;
+                            // Convert to angle offsets
+                            let (w, h) =
+                                (renderer.params.width as f32, renderer.params.height as f32);
+                            renderer.params.center_theta1 -=
+                                (dx as f32 / w) * (2.0 * renderer.params.half_span1);
+                            renderer.params.center_theta2 -=
+                                (dy as f32 / h) * (2.0 * renderer.params.half_span2);
+                            renderer.queue.write_buffer(
+                                &renderer.params_buffer,
+                                0,
+                                bytemuck::cast_slice(&[renderer.params]),
+                            );
+                            frame_rendered = false;
+                        }
+                        // Update pan_prev for next move
+                        pan_prev = last_cursor;
+                    }
+                }
+
                 WindowEvent::MouseInput {
                     state,
                     button: MouseButton::Left,
                     ..
                 } => {
-                    dragging = state == ElementState::Pressed;
-                    if !dragging {
-                        last_cursor = None;
+                    match state {
+                        ElementState::Pressed => {
+                            dragging = true;
+                            click_pos = last_cursor; // record where click began
+                            pan_prev = last_cursor; // initialize for panning
+                        }
+                        ElementState::Released => {
+                            dragging = false;
+                            pan_prev = None; // stop panning
+                            println!("Click position: {:?}", click_pos);
+
+                            // If press & release were close → treat as click
+                            if let (Some((sx, sy)), Some((ex, ey))) = (click_pos, last_cursor) {
+                                let dist2 = (sx - ex).powi(2) + (sy - ey).powi(2);
+                                if dist2 < 25.0 {
+                                    // within 5px
+                                    // Map pixel to normalized coords, then to angles
+                                    let nx = (ex as f32 / WIDTH as f32 - 0.5) * 2.0;
+                                    let ny = (ey as f32 / HEIGHT as f32 - 0.5) * 2.0;
+                                    let theta1 = renderer.params.center_theta1
+                                        + nx * renderer.params.half_span1;
+                                    let theta2 = renderer.params.center_theta2
+                                        + ny * renderer.params.half_span2;
+
+                                    // Launch single-pendulum sim
+                                    renderer.trajectory =
+                                        Some(renderer.simulate_single(theta1, theta2));
+                                    renderer.traj_index = 0;
+                                    renderer.animate_traj = false;
+                                    frame_rendered = false;
+                                }
+                            }
+                        }
                     }
                 }
-                WindowEvent::CursorMoved { position, .. } if dragging => {
-                    if let Some((lx, ly)) = last_cursor {
-                        let dx = position.x - lx;
-                        let dy = position.y - ly;
-                        // Convert pixel delta → angle delta:
-                        // note: window size → params.half_span
-                        let (w, h) = (renderer.params.width as f32, renderer.params.height as f32);
-                        let ang_dx = -(dx as f32 / w) * (2.0 * renderer.params.half_span1);
-                        let ang_dy = -(dy as f32 / h) * (2.0 * renderer.params.half_span2);
-                        renderer.params.center_theta1 += ang_dx;
-                        renderer.params.center_theta2 += ang_dy;
-                        renderer.queue.write_buffer(
-                            &renderer.params_buffer,
-                            0,
-                            bytemuck::cast_slice(&[renderer.params]),
-                        );
-                        frame_rendered = false;
-                    }
-                    last_cursor = Some((position.x, position.y));
-                }
+
                 _ => {}
             },
+
             Event::MainEventsCleared => {
                 let now = Instant::now();
                 let delta_time = now.duration_since(last_frame_time).as_secs_f32();
@@ -505,6 +668,7 @@ fn main() -> Result<(), Error> {
 
                 if !frame_rendered {
                     pollster::block_on(renderer.render(pixels.frame_mut()));
+                    renderer.overlay_trajectory(pixels.frame_mut());
                     frame_rendered = true;
                 }
 
