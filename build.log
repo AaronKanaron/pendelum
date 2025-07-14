@@ -1,0 +1,15 @@
+   Compiling image_test v0.1.0 (/Users/aaronclauss/Code/Eget/rust-visualize/image_test)
+warning: unused variable: `current_params`
+   --> src/main.rs:101:13
+    |
+101 |         let current_params = params.clone(); // spara en kopia
+    |             ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_current_params`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: Linking globals named 'wgpu_render_pass_set_bind_group': symbol multiply defined!
+
+error: failed to load bitcode of module "wgpu_core-9ada33d687b4f358.wgpu_core.a0ba9069a06708ac-cgu.03.rcgu.o": 
+
+warning: `image_test` (bin "image_test") generated 2 warnings
+error: could not compile `image_test` (bin "image_test") due to 1 previous error; 2 warnings emitted

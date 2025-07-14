@@ -1,0 +1,17 @@
+[package]
+name = "image_test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+pixels = "0.14"
+winit = "0.28"
+wgpu = "0.17"
+bytemuck = { version = "1.0", features = ["derive"] }
+futures = "0.3"
+pollster = "0.3"
+env_logger = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = false
