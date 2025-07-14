@@ -36,7 +36,6 @@ struct DoublePendulumRenderer {
 
     /// Trajectory points in normalized coordinates [0..1]
     trajectory: Option<Vec<[f32; 2]>>, // [x1, y1, x2, y2] per frame
-    traj_velocities: Option<Vec<[f32; 2]>>,
     /// Animation progress index
     traj_index: usize,
     /// Whether we animate over time (vs. static draw)
@@ -208,7 +207,6 @@ impl DoublePendulumRenderer {
             params,
             sensitivity: 0.1, // Default sensitivity
             trajectory: None,
-            traj_velocities: None,
             traj_index: 0,
             animate_traj: false,
             click_angles: None,
@@ -408,11 +406,7 @@ impl DoublePendulumRenderer {
     }
 
     /// Simulate one pendulum for `time_steps` and return the final angular velocities.
-    fn simulate_single(
-        &self,
-        theta1: f32,
-        theta2: f32,
-    ) -> (Vec<[f32; 2]>, Vec<[f32; 2]>, f32, f32) {
+    fn simulate_single(&self, theta1: f32, theta2: f32) -> (Vec<[f32; 2]>, f32, f32) {
         let mut traj = Vec::with_capacity(self.params.time_steps as usize);
 
         // state
@@ -430,7 +424,6 @@ impl DoublePendulumRenderer {
         let m2 = self.params.mass2;
         let damping = self.params.damping;
 
-        let mut vel_hist = Vec::with_capacity(self.params.time_steps as usize);
         for _ in 0..self.params.time_steps {
             // compute accelerations
             let c = (th1 - th2).cos();
@@ -458,11 +451,10 @@ impl DoublePendulumRenderer {
 
             // record angles for your fractal trace
             traj.push([th1, th2]);
-            vel_hist.push([om1, om2]);
         }
 
         // return the trajectory plus the final omegas
-        (traj, vel_hist, om1, om2)
+        (traj, om1, om2)
     }
 
     /// Call on every frame (after computing the fractal), so the trace
@@ -477,7 +469,7 @@ impl DoublePendulumRenderer {
 
         // number of points to draw
         let pts = if self.animate_traj {
-            self.traj_index = (self.traj_index + 4).min(traj.len());
+            self.traj_index = (self.traj_index + 1).min(traj.len());
             self.traj_index
         } else {
             traj.len()
@@ -802,29 +794,25 @@ fn main() -> Result<(), Error> {
                         if dragging && !shift_down {
                             // Map to normalized coords
                             let (theta1, theta2) = renderer.screen_to_world(ex as f32, ey as f32);
-                            // let (trajectory, final_om1, final_om2) =
-                            //     renderer.simulate_single(theta1, theta2);
-
-                            let (traj, vel_hist, f1, f2) = renderer.simulate_single(theta1, theta2);
-                            renderer.traj_velocities = Some(vel_hist);
-                            (traj, f1, f2);
+                            let (trajectory, final_om1, final_om2) =
+                                renderer.simulate_single(theta1, theta2);
 
                             // let f1 = map_vel_to_freq(final_om1, 10.0, 100.0, 1000.0);
                             // let f2 = map_vel_to_freq(final_om2, 10.0, 100.0, 1000.0);
                             // audio.freq_left.store(f1, Ordering::Relaxed);
                             // audio.freq_right.store(f2, Ordering::Relaxed);
-                            let f1 = map_vel_to_freq(f1, 10.0, 100.0, 1000.0);
-                            let f2 = map_vel_to_freq(f2, 10.0, 100.0, 1000.0);
+                            let f1 = map_vel_to_freq(final_om1, 10.0, 100.0, 1000.0);
+                            let f2 = map_vel_to_freq(final_om2, 10.0, 100.0, 1000.0);
                             // store base freq and last velocity
                             audio.freq_left.store(f1, Ordering::Relaxed);
                             audio.freq_right.store(f2, Ordering::Relaxed);
-                            audio.vel_left.store(f1, Ordering::Relaxed);
-                            audio.vel_right.store(f2, Ordering::Relaxed);
+                            audio.vel_left.store(final_om1, Ordering::Relaxed);
+                            audio.vel_right.store(final_om2, Ordering::Relaxed);
 
                             renderer.click_angles = Some((theta1, theta2));
-                            // renderer.trajectory = Some(traj);
+                            renderer.trajectory = Some(trajectory);
                             renderer.traj_index = 0;
-                            renderer.animate_traj = true;
+                            renderer.animate_traj = false;
                             frame_rendered = false;
                         }
 
@@ -878,28 +866,20 @@ fn main() -> Result<(), Error> {
                                     let (theta1, theta2) =
                                         renderer.screen_to_world(ex as f32, ey as f32);
                                     renderer.click_angles = Some((theta1, theta2));
-                                    // let (trajectory, final_om1, final_om2) =
-                                    //     renderer.simulate_single(theta1, theta2);
-
-                                    let (traj, vel_hist, f1, f2) =
+                                    let (trajectory, final_om1, final_om2) =
                                         renderer.simulate_single(theta1, theta2);
-                                    renderer.trajectory = Some(traj);
-                                    renderer.traj_velocities = Some(vel_hist);
-                                    // (trajectory, final_om1, final_om2) =
-                                    //     (renderer.trajectory.as_ref().unwrap().clone(), f1, f2);
-
-                                    // renderer.trajectory = Some(traj);
+                                    renderer.trajectory = Some(trajectory);
                                     renderer.traj_index = 0;
-                                    renderer.animate_traj = true;
+                                    renderer.animate_traj = false;
                                     frame_rendered = false;
 
-                                    let f1 = map_vel_to_freq(f1, 10.0, 100.0, 1000.0);
-                                    let f2 = map_vel_to_freq(f2, 10.0, 100.0, 1000.0);
+                                    let f1 = map_vel_to_freq(final_om1, 10.0, 100.0, 1000.0);
+                                    let f2 = map_vel_to_freq(final_om2, 10.0, 100.0, 1000.0);
                                     // store base freq and last velocity
                                     audio.freq_left.store(f1, Ordering::Relaxed);
                                     audio.freq_right.store(f2, Ordering::Relaxed);
-                                    audio.vel_left.store(f1, Ordering::Relaxed);
-                                    audio.vel_right.store(f2, Ordering::Relaxed);
+                                    audio.vel_left.store(final_om1, Ordering::Relaxed);
+                                    audio.vel_right.store(final_om2, Ordering::Relaxed);
                                 }
                             }
                         }
@@ -922,32 +902,22 @@ fn main() -> Result<(), Error> {
                     need_redraw = true;
                 }
                 if need_redraw {
+                    // compute the fractal background only once per parameter change
                     pollster::block_on(renderer.render(pixels.frame_mut()));
+                    // draw the trajectory up to the current index,
+                    // and advance `traj_index` internally
                     renderer.overlay_trajectory(pixels.frame_mut());
                     frame_rendered = true;
 
-                    // if we're animating, also drive audio from the current step
-                    if renderer.animate_traj {
-                        if let (Some(vels), Some(idx)) =
-                            (&renderer.traj_velocities, Some(renderer.traj_index.saturating_sub(1)))
-                        {
-                            let [om1, om2] = vels[idx.min(vels.len().saturating_sub(1))];
-                            let f1 = map_vel_to_freq(om1, 10.0, 100.0, 1000.0);
-                            let f2 = map_vel_to_freq(om2, 10.0, 100.0, 1000.0);
-                            audio.freq_left.store(f1, Ordering::Relaxed);
-                            audio.freq_right.store(f2, Ordering::Relaxed);
-                            audio.vel_left.store(om1, Ordering::Relaxed);
-                            audio.vel_right.store(om2, Ordering::Relaxed);
-                        }
-
-                        // keep animating until we hit the end
-                        if let Some(traj) = &renderer.trajectory {
-                            if renderer.traj_index < traj.len() {
-                                frame_rendered = false;
-                            } else {
-                                renderer.animate_traj = false;
-                            }
-                        }
+                    // if we're animating and still have more to draw,
+                    // force another redraw next frame
+                    if renderer.animate_traj
+                        && renderer.traj_index < renderer.trajectory.as_ref().unwrap().len()
+                    {
+                        frame_rendered = false;
+                    } else {
+                        // once we're done, turn off animate so it will draw fully on next click
+                        renderer.animate_traj = false;
                     }
                 }
 
